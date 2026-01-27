@@ -38,24 +38,30 @@ impl ChannelProcessor {
         loop {
           
             for (id, rx) in self.tx_nodes.iter().enumerate() {
-                let frame = rx.recv().expect("TX disconnected");
-                self.buffer
-                    .entry(frame.epoch)
-                    .or_default()
-                    .push(Frame {
-                        frame,
-                        sender_id: id,
-                    });
+                match rx.try_recv() {
+                    Ok(frame) => {
+                        self.buffer
+                            .entry(frame.epoch)
+                            .or_default()
+                            .push(Frame {
+                                frame,
+                                sender_id: id,
+                            });
+                    },
+                    Err(e) => {
+
+                        continue;
+                    }
+                }
             }
 
-            let (&epoch, frames) = self.buffer.iter().next().unwrap();
-
-            
-            if frames.len() < self.tx_nodes.len() {
+            let Some((&epoch, frames)) = self.buffer.iter().next() else {
+                // No frames collected yet → nothing to do
+                tokio::task::yield_now().await;
                 continue;
-            }
+            };
 
-            
+      
             for rx_id in 0..self.rx_nodes.len() {
                 let mut txbuf = vec![Complex32::new(0.0, 0.0); 1024];
 
@@ -63,16 +69,30 @@ impl ChannelProcessor {
                 
                     let d_nm = self.d_matrix[frame.sender_id][rx_id];
                     
+                    if frame.sender_id == rx_id{
+                        // skip loop
+                        continue;
+                    }
+
                     let c_nm : Complex32 = (Complex32::new(1.0, 1.0) * (d_nm+1.0).powi(-3)) / 1.41421356237;  
-                  
+                    
                     for i in 0..1024 {
                         txbuf[i] += frame.frame.samples[i] * c_nm ;
                     }
                 }
-
-                self.rx_nodes[rx_id]
-                    .send(IqFrame { epoch, samples: txbuf.try_into().unwrap() })
-                    .unwrap();
+                let frame = IqFrame {
+                    epoch: epoch,
+                    samples : {
+                        let mut samples = [Complex32::default(); 1024];
+                        samples.copy_from_slice(&txbuf[..1024]);
+                        samples
+                    },
+                };
+                
+                let result = self.rx_nodes[rx_id].send(frame);
+                if let Err(e) = result {
+                    println!("send error: {}", e);
+                }
             }
 
            
