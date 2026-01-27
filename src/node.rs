@@ -1,8 +1,11 @@
+use core::time;
+use std::sync::Arc;
+
 use crossbeam_channel::{Receiver, Sender};
-use futuresdr::{async_io::Timer, blocks::BlobToUdp, macros::connect, prelude::{Complex32, DefaultCpuReader, DefaultCpuWriter}, runtime::{BlockId, Flowgraph, FlowgraphHandle, Pmt, scheduler::SmolScheduler}};
+use futuresdr::{async_io::Timer, blocks::BlobToUdp, macros::connect, prelude::{Complex32, DefaultCpuReader, DefaultCpuWriter}, runtime::{BlockId, BlockRef, Flowgraph, FlowgraphHandle, Pmt, WrappedKernel, scheduler::SmolScheduler}, tracing::Instrument};
 use futuresdr::runtime::Runtime;
 use anyhow::Result;
-use tokio::net::UdpSocket;
+use tokio::{net::UdpSocket, task::JoinHandle};
 
 use crate::{AddAWGN, ChannelPublisher, ChannelSubscriber, Decoder, Deinterleaver, FftDemod, FrameSync, GrayMapping, HammingDecoder, HeaderDecoder, HeaderMode, IqFrame, Transmitter, utils::{
     Bandwidth, Channel, CodeRate, SpreadingFactor
@@ -20,7 +23,8 @@ pub struct Node {
     sigma : f32,
     
     //DSP interface
-    transmitter: BlockId,
+    transmitter: BlockRef<Transmitter>,
+    pub fg : Option<Flowgraph>,
 
     //aka MAC interface
     remote_port: u16, // remote port
@@ -43,6 +47,8 @@ impl Node {
 
         local_port: u16,
         remote_port: u16,
+
+        // rt : Runtime<'_, SmolScheduler>,
     ) -> Result<Self> {
         //TODO: coderate setup
         //rx graph
@@ -112,17 +118,9 @@ impl Node {
             transmitter > publisher;
         );    
 
-        let rt = Runtime::new();
-       
-        // server task create  
-        let tx = transmitter.into();
         
-        let (_fg, handle) = rt.start_sync(fg)?;
+        println!("flowgraph started");
         
-        // let handle_for_task = handle.clone();
-        tokio::spawn(Self::server_task_body(handle, tx, local_port));
-        
-       
         Ok(Self {
             channel,
             bw,
@@ -130,14 +128,14 @@ impl Node {
             sync_word,
             oversampling,
             sigma,
-            // flowgraph: fg,
-            transmitter: tx,
+            fg: Some(fg),
+            transmitter: transmitter,
             remote_port,
             local_port,
         })
     }
 
-    async fn server_task_body(mut handle: FlowgraphHandle, tx: BlockId, local_port: u16) {
+    async fn server_task_body(mut handle: FlowgraphHandle, tx_id : BlockId, local_port: u16) {
         let src = format!("127.0.0.1:{}", local_port);
         let socket= match UdpSocket::bind(src).await {
             Ok(s) => s,
@@ -148,13 +146,26 @@ impl Node {
         };
        
         let mut buf = vec![0u8; 1500];
+        let resp = [0xC0, 0x0F, 0x00, 0xC0];
+        println!("thread running, listen port: {}", local_port);
         loop {
             match socket.recv_from(&mut buf).await {
                 Ok((n, _peer)) => {
                     let payload = buf[..n].to_vec();
-                    if let Err(e) = handle.call(tx, "msg", Pmt::Blob(payload.clone())).await {
+                    for i in 0..n {
+                        print!("{} ", payload[i]);
+                    }
+                    println!(" payload len {}", n);
+                    if let Err(e) = handle.call(tx_id, "msg", Pmt::Blob(resp.to_vec())).await {
                         eprintln!("flowgraph call error: {}", e);
                     }
+                    
+                    // Check if the block has finished
+                    println!("peer ip: {}:{}",  _peer.ip(), _peer.port());
+                    if let Err(e) = socket.send_to(&resp, _peer).await {
+                        eprintln!("error sending response: {}", e);
+                    }
+                    println!("TRANSMISSION FINISHED");
                 }
                 Err(e) => {
                     eprintln!("socket recv error: {}", e);
@@ -163,6 +174,33 @@ impl Node {
             }            
         }
     }
+
+    pub fn server_task_create(&self, handle: FlowgraphHandle) {
+        let tx_id = self.transmitter.clone().into();
+        let local_port = self.local_port;
+
+        tokio::spawn(
+            Self::server_task_body(handle, tx_id, local_port)
+        );
+    }
+
+    pub fn start(
+        &mut self,
+        rt: &mut Runtime<'_, SmolScheduler>,
+        enabled: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+
+        let fg = self.fg.take().expect("Flowgraph already started");
+
+        let (_fg, handle) = rt.start_sync(fg)?;
+
+        if enabled {
+            self.server_task_create(handle);
+        }
+
+        Ok(())
+    }
+    
 
     pub fn get_sample_rate(self) -> u32 {
         if matches!(self.bw, Bandwidth::BW62) {
