@@ -13,12 +13,9 @@ async fn main() -> Result<()> {
     let (tx_node_pub2, tx_node_sub2) = unbounded::<IqFrame>();
     let (rx_node_pub2, rx_node_sub2) = unbounded::<IqFrame>();
     
-    // let channel = Channel::EU868_1;
-    // let bandwidth = Bandwidth::BW125;
-    // let spreading_factor = SpreadingFactor::SF7;
     let sync_word:u8 = 0x12;
-    let oversampling = 8; 
-    let noise_std =2e-2;
+    let oversampling = 4; 
+    let noise_std =2e-6;
 
     let (bandwidth, spreading_factor, _, channel, ldro) = MeshtasticConfig::LongFastEu.to_config();
     
@@ -31,12 +28,6 @@ async fn main() -> Result<()> {
     let tx_nodes = vec![tx_node_sub, tx_node_sub2];
     let rx_nodes = vec![rx_node_pub, rx_node_pub2];
 
-    let cm = ChannelProcessor::new(tx_nodes, rx_nodes, d_matrix);
-    tokio::spawn(async move{
-        let _ = cm.spawn_task().await;
-    });
- 
-   
     let node = Node::new(
         channel,
         bandwidth,
@@ -50,7 +41,7 @@ async fn main() -> Result<()> {
         tx_node_pub,
         55554,
         55555,
-        
+ 
     );
     let node2 = Node::new(
         channel,
@@ -65,7 +56,19 @@ async fn main() -> Result<()> {
         tx_node_pub2,
         55556,
         55557,
+
     );
+
+    let mut rt = Runtime::new();
+
+    node.unwrap().start(&mut rt, true);
+    node2.unwrap().start(&mut rt, true);
+
+
+    let cm = ChannelProcessor::new(tx_nodes, rx_nodes, d_matrix);
+    tokio::spawn(async move{
+        let _ = cm.spawn_task().await;
+    });
     loop{}
     println!("Single flowgraph completed successfully!");
     Ok(())
