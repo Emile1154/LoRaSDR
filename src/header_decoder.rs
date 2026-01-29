@@ -1,7 +1,7 @@
 use futuresdr::prelude::*;
 use std::cmp::min;
 use std::collections::HashMap;
-
+use crate::kiss_driver::*;
 #[derive(Debug, Clone)]
 pub struct Frame {
     pub nibbles: Vec<u8>,
@@ -35,7 +35,7 @@ pub enum HeaderMode {
 const HEADER_LEN: usize = 5; // size of the header in nibbles
 
 #[derive(Block)]
-#[message_outputs(out, frame_info)]
+#[message_outputs(out, frame_info, kiss)]
 pub struct HeaderDecoder<I = DefaultCpuReader<u8>>
 where
     I: CpuBufferReader<Item = u8>,
@@ -226,6 +226,8 @@ where
                 info!("CRC presence:   {}", has_crc);
                 info!("Coding rate:    {}", code_rate);
 
+                let mut header_result = RADIOLIB_SX126X_IRQ_HEADER_ERR;
+
                 let mut head_err = header_chk as i16
                     - ((c4 << 4) + (c3 << 3) + (c2 << 2) + (c1 << 1) + c0) as i16
                     != 0;
@@ -245,7 +247,10 @@ where
                     head_err = true;
                 } else {
                     debug!("Header checksum valid!");
+                    header_result = RADIOLIB_SX126X_IRQ_HEADER_VALID;
                 }
+                let kiss_detect = create_cmd(kiss::CMD_DETECT, &[header_result] );
+                mio.post("kiss", Pmt::Blob( kiss_detect.clone() )).await.unwrap();
 
                 Self::publish_frame_info(
                     mio,

@@ -3,10 +3,10 @@ use std::collections::HashMap;
 
 use crate::Frame;
 use crate::utils::*;
-
+use crate::kiss_driver::*;
 #[derive(Block)]
 #[message_inputs(r#in)]
-#[message_outputs(out, out_annotated, rftap, crc_check)]
+#[message_outputs(out, out_annotated, kiss, crc_check)]
 #[null_kernel]
 pub struct Decoder;
 
@@ -83,34 +83,24 @@ impl Decoder {
             true
         };
 
-        if crc_passed {
-            let mut rftap = vec![0; dewhitened.len() + 12 + 15];
-            rftap[0..4].copy_from_slice("RFta".as_bytes());
-            rftap[4..6].copy_from_slice(&3u16.to_le_bytes());
-            rftap[6..8].copy_from_slice(&1u16.to_le_bytes());
-            rftap[8..12].copy_from_slice(&270u32.to_le_bytes());
-            rftap[12] = 0; // version
-            rftap[13] = 0; // padding
-            rftap[14..16].copy_from_slice(&15u16.to_be_bytes()); // header len
-            rftap[16..20].copy_from_slice(&868100000u32.to_be_bytes()); // frequency
-            rftap[20] = 1; // bandwidth
-            rftap[21] = 7; // spreading factor
-            rftap[22] = 0; // packet rssi
-            rftap[23] = 0; // max_rssi
-            rftap[24] = 0; // current_rssi
-            rftap[25] = 0; // net_id_caching
-            rftap[26] = 0x12; // sync word
-            rftap[27..].copy_from_slice(&dewhitened);
-            mio.post("rftap", Pmt::Blob(rftap.clone())).await.unwrap();
+        let cmd_data = create_cmd(kiss::CMD_DATA, dewhitened.as_slice());
+        mio.post("kiss", Pmt::Blob(cmd_data.clone())).await.unwrap();
 
-            // let data = String::from_utf8_lossy(&dewhitened[..dewhitened.len() - 2]);
-            // info!("received frame: {}", data);
+        let mut crc_payload_ok = RADIOLIB_SX126X_IRQ_CRC_ERR;
+
+        if crc_passed {
+            crc_payload_ok = 0;
+            let cmd_ready = create_cmd(kiss::CMD_READY, &[crc_payload_ok]);
+            mio.post("kiss", Pmt::Blob(cmd_ready.clone())).await.unwrap();
             info!("DECODER received frame [bin]: {:02x?}", &dewhitened);
             Some(dewhitened)
         } else {
+            let cmd_ready = create_cmd(kiss::CMD_READY, &[crc_payload_ok]);
+            mio.post("kiss", Pmt::Blob(cmd_ready.clone())).await.unwrap();
             info!("DECODER FAILED frame [bin]: {:02x?}", &dewhitened);
             None
         }
+        
     }
 
     async fn r#in(

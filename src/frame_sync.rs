@@ -4,12 +4,13 @@ use rustfft::Fft;
 use rustfft::FftDirection;
 use rustfft::FftPlanner;
 use std::collections::HashMap;
+use std::f32::consts::LOG10_E;
 use std::f32::consts::PI;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
-
+use crate::kiss_driver::*;
 use crate::utils::*;
 
 #[derive(Debug, Copy, Clone, PartialEq)]
@@ -743,12 +744,13 @@ impl State {
         (items_to_consume, items_to_output)
     }
 
-    fn sync(
+    async fn sync<'a>(
         &mut self,
         input: &[Complex32],
         out: &mut [Complex32],
-        tags: &mut Tags,
+        tags: &'a mut Tags<'a>,
         nitems_to_process: usize,
+        _mio: &mut MessageOutputs,
     ) -> (isize, usize) {
         let mut items_to_output = 0;
         if !self.cfo_frac_sto_frac_est {
@@ -853,6 +855,32 @@ impl State {
             SyncState::QuarterDown => {
                 (items_to_consume, items_to_output) =
                     self.sync_quarter_down(input, out, tags, nitems_to_process);
+                
+                let snr = self.snr_est as f32;
+                let snr_bytes = snr.to_le_bytes();
+
+                let cmd_snr = create_cmd(kiss::CMD_SNR, &snr_bytes);
+                _mio.post("kiss", Pmt::Blob(cmd_snr.clone())).await;
+
+                
+                let mut avg_rssi:f32 = 0.0;
+                if nitems_to_process > 0 {
+                    let mut sum_dbm: f32 = 0.0;
+                    for sample in input{
+                        let magnitude_squared = sample.norm_sqr();
+                        if magnitude_squared > 0.0 {
+                            let dbm = (10.0 * (magnitude_squared/0.001).ln()*LOG10_E) as f32;
+                            sum_dbm += dbm
+                        }else{
+                            sum_dbm += -1000.0;
+                        }
+                    }
+                    avg_rssi = sum_dbm / nitems_to_process as f32
+                }
+                
+                let cmd_rssi = create_cmd(kiss::CMD_RSSI,&avg_rssi.to_le_bytes() );
+                _mio.post("kiss", Pmt::Blob(cmd_rssi.clone())).await;
+
             }
             _ => warn!("encountered unexpercted symbol_cnt SyncState."),
         }
@@ -1037,7 +1065,7 @@ const MAX_UNKNOWN_NET_ID_OFFSET: usize = 1;
 
 #[derive(Block)]
 #[message_inputs(bandwidth, center_freq, frame_info, payload_crc_result, poke)]
-#[message_outputs(net_id_caching, frame_detected, detection_failed)]
+#[message_outputs(net_id_caching, frame_detected, detection_failed, kiss)]
 pub struct FrameSync<I = DefaultCpuReader<Complex32>, O = DefaultCpuWriter<Complex32>>
 where
     I: CpuBufferReader<Item = Complex32>,
@@ -1395,9 +1423,13 @@ where
                         self.s.detect(input)
                     }
                 }
-                DecoderState::Sync => self.s.sync(input, out, &mut out_tags, nitems_to_process),
+                DecoderState::Sync => {
+                    let (items_to_consume, items_to_output) = self.s.sync(input, out, &mut out_tags, nitems_to_process, _mio).await;
+                    (items_to_consume, items_to_output)
+                }
                 DecoderState::SfoCompensation => self.s.compensate_sfo(out, &mut out_tags),
             };
+            
             debug_assert!(
                 items_to_consume >= 0,
                 "tried to consume negative amount of samples ({items_to_consume})"
