@@ -2,12 +2,13 @@ use core::time;
 use std::sync::Arc;
 
 use crossbeam_channel::{Receiver, Sender};
-use futuresdr::{async_io::Timer, blocks::BlobToUdp, macros::connect, prelude::{Complex32, DefaultCpuReader, DefaultCpuWriter}, runtime::{BlockId, BlockRef, Flowgraph, FlowgraphHandle, Pmt, WrappedKernel, scheduler::SmolScheduler}, tracing::Instrument};
+use futuredsp::firdes;
+use futuresdr::{async_io::Timer, blocks::{BlobToUdp, XlatingFir}, macros::connect, prelude::{Complex32, DefaultCpuReader, DefaultCpuWriter}, runtime::{BlockId, BlockRef, Flowgraph, FlowgraphHandle, Pmt, WrappedKernel, scheduler::SmolScheduler}, tracing::Instrument};
 use futuresdr::runtime::Runtime;
 use anyhow::Result;
 use tokio::{net::UdpSocket, task::JoinHandle};
 
-use crate::{AddAWGN, ChannelPublisher, ChannelSubscriber, Decoder, Deinterleaver, FftDemod, FrameSync, GrayMapping, HammingDecoder, HeaderDecoder, HeaderMode, IqFrame, Transmitter, utils::{
+use crate::{AddAWGN, ChannelPublisher, ChannelSubscriber, Decoder, Deinterleaver, FftDemod, FrameSync, GrayMapping, HammingDecoder, HeaderDecoder, HeaderMode, IqFrame, Transmitter, frame_sync, utils::{
     Bandwidth, Channel, CodeRate, SpreadingFactor
 }};
 
@@ -52,6 +53,14 @@ impl Node {
     ) -> Result<Self> {
         //TODO: coderate setup
         //rx graph
+        let interpolation = match bw {
+            Bandwidth::BW62 => 16,
+            Bandwidth::BW125 => 8,
+            Bandwidth::BW250 => 4,
+            _ => panic!("wrong bandwidth for Meshtastic"),
+        };
+
+
         let subscriber =
         ChannelSubscriber::<DefaultCpuWriter<Complex32>>
         ::new(receiver);
@@ -61,13 +70,25 @@ impl Node {
         ::new(sigma, 42);
         // let throttle = futuresdr::blocks::Throttle::<Complex32>::new(samplerate as f64);
 
+        // let decimation = match bw {
+        //     Bandwidth::BW62 => 4,
+        //     Bandwidth::BW125 => 2,
+        //     Bandwidth::BW250 => 1,
+        //     _ => panic!("wrong bandwidth for Meshtastic"),
+        // };
+        // let cutoff = Into::<f64>::into(bw) / 2.0 / 1e6;
+        // let transition_bw = Into::<f64>::into(bw) / 10.0 / 1e6;
+        // let taps = firdes::kaiser::lowpass(cutoff, transition_bw, 0.05);
+        // let decimation: XlatingFir = XlatingFir::with_taps(taps, decimation, 200e3, 1e6);
+
+
         let frame_sync: FrameSync = FrameSync::new(
             channel,
             bw,
             sf,
             implicit_header,
             vec![vec![sync_word.into()]],
-            oversampling,
+            interpolation,
             None,
             Some("header_crc_ok"),
             false,
@@ -96,10 +117,10 @@ impl Node {
             sf,
             ldro,
             implicit_header,
-            oversampling,
+            interpolation,
             vec![sync_word as usize],
             8,
-            0,
+            10000,
         );
         let publisher = ChannelPublisher
         ::<DefaultCpuReader<Complex32>>
@@ -110,10 +131,15 @@ impl Node {
         
         connect!(fg,
             // rx graph 
-            subscriber > awgn > frame_sync > fft_demod > gray_mapping > deinterleaver > hamming_dec > header_decoder;
+            subscriber > awgn > frame_sync; 
+            frame_sync > fft_demod > gray_mapping > deinterleaver > hamming_dec > header_decoder;
+
+            frame_sync.kiss           | udp_data;
             header_decoder.frame_info | frame_info.frame_sync;
-            header_decoder | decoder;
-            decoder.rftap | udp_data;
+            header_decoder            | decoder;
+            header_decoder.kiss       | udp_data;
+            decoder.crc_check         | payload_crc_result.frame_sync;
+            decoder.kiss              | udp_data;
             // tx graph
             transmitter > publisher;
         );    
@@ -152,20 +178,12 @@ impl Node {
             match socket.recv_from(&mut buf).await {
                 Ok((n, _peer)) => {
                     let payload = buf[..n].to_vec();
-                    for i in 0..n {
-                        print!("{} ", payload[i]);
-                    }
-                    println!(" payload len {}", n);
-                    if let Err(e) = handle.call(tx_id, "msg", Pmt::Blob(resp.to_vec())).await {
+                    if let Err(e) = handle.call(tx_id, "msg", Pmt::Blob(payload)).await {
                         eprintln!("flowgraph call error: {}", e);
                     }
-                    
-                    // Check if the block has finished
-                    println!("peer ip: {}:{}",  _peer.ip(), _peer.port());
                     if let Err(e) = socket.send_to(&resp, _peer).await {
                         eprintln!("error sending response: {}", e);
                     }
-                    println!("TRANSMISSION FINISHED");
                 }
                 Err(e) => {
                     eprintln!("socket recv error: {}", e);
