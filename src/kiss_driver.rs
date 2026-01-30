@@ -73,6 +73,9 @@ pub fn descape(data: &[u8]) -> Vec<u8> {
 }
 
 pub fn create_cmd(cmd: u8, data: &[u8]) -> Vec<u8> {
+    if cmd == kiss::CMD_DATA {
+        return data.to_vec();
+    }
     let mut result = Vec::with_capacity(data.len() + 2);
     result.push(kiss::FEND);
     result.push(cmd);
