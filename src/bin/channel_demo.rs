@@ -13,7 +13,7 @@ async fn main() -> Result<()> {
     let (tx_node_pub2, tx_node_sub2) = unbounded::<IqFrame>();
     let (rx_node_pub2, rx_node_sub2) = unbounded::<IqFrame>();
     
-    let sync_word:u8 = 0x12;
+    let sync_word:u8 = 0x2b;
     let oversampling = 4; 
     let noise_std =2e-6;
 

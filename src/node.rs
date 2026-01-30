@@ -87,7 +87,7 @@ impl Node {
             bw,
             sf,
             implicit_header,
-            vec![vec![sync_word.into()]],
+            vec![vec![16, 88]],
             interpolation,
             None,
             Some("header_crc_ok"),
@@ -118,7 +118,7 @@ impl Node {
             ldro,
             implicit_header,
             interpolation,
-            vec![sync_word as usize],
+            vec![16, 88],
             8,
             10000,
         );
