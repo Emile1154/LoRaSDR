@@ -39,7 +39,62 @@ pub enum MeshtasticConfig {
     VeryLongSlowUs,
 }
 
+pub struct Setting {
+    ch_500_khz: Channel,
+    ch_250_khz: Channel,
+    ch_125_khz: Channel,
+}
+
+
 impl MeshtasticConfig {
+    const REGION_FREQ : [( &'static str, Setting ); 3] = [
+        ("EU433", Setting { ch_500_khz: Channel::Custom(433_250_000), ch_250_khz: Channel::Custom(433_125_000), ch_125_khz: Channel::Custom(433_062_500) }),
+        ("EU868", Setting { ch_500_khz: Channel::Custom(869_650_000), ch_250_khz: Channel::Custom(869_525_000), ch_125_khz: Channel::Custom(869_462_500) }),
+        ("RU",    Setting { ch_500_khz: Channel::Custom(868_950_000), ch_250_khz: Channel::Custom(868_825_000), ch_125_khz: Channel::Custom(868_762_500) }),
+
+    ];
+      
+
+    pub fn get_all_configs(&self, region: &str) -> Vec<(Bandwidth, Channel, Vec<(SpreadingFactor, bool, CodeRate)>)> {
+        // Find the region settings
+        let setting = Self::REGION_FREQ
+            .iter()
+            .find(|(r, _)| *r == region)
+            .map(|(_, s)| s)
+            .expect("Unknown region");
+        
+        // only 0 slots
+        vec![
+            (
+                Bandwidth::BW500,
+                setting.ch_500_khz,
+                vec![
+                    (SpreadingFactor::SF7, false, CodeRate::CR_4_5),
+                    (SpreadingFactor::SF11, false, CodeRate::CR_4_8),
+                ],
+            ),
+            (
+                Bandwidth::BW250,
+                setting.ch_250_khz,
+                vec![
+                    (SpreadingFactor::SF7, false, CodeRate::CR_4_5),
+                    (SpreadingFactor::SF8, false, CodeRate::CR_4_5),
+                    (SpreadingFactor::SF9, false, CodeRate::CR_4_5),
+                    (SpreadingFactor::SF10, false, CodeRate::CR_4_5),
+                    (SpreadingFactor::SF11, false, CodeRate::CR_4_5),
+                ],
+            ),
+            (
+                Bandwidth::BW125,
+                setting.ch_125_khz,
+                vec![
+                    (SpreadingFactor::SF11, true, CodeRate::CR_4_8),
+                    (SpreadingFactor::SF12, true, CodeRate::CR_4_8),
+                ],
+            ),
+        ]
+    }
+
     pub fn to_config(&self) -> (Bandwidth, SpreadingFactor, CodeRate, Channel, bool) {
         match self {
             Self::ShortFastEu => (
