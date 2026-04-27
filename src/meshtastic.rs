@@ -1,3 +1,5 @@
+use core::result::Result;
+
 use base64::prelude::*;
 use ctr::cipher::KeyIvInit;
 use ctr::cipher::StreamCipher;
@@ -20,195 +22,175 @@ const DEFAULT_KEY: [u8; 16] = [
 #[clap(rename_all = "SCREAMING_SNAKE_CASE")]
 #[allow(non_camel_case_types)]
 pub enum MeshtasticConfig {
-    ShortFastEu,
-    ShortSlowEu,
-    MediumFastEu,
-    MediumSlowEu,
+    ShortTurbo,
+    ShortFast,
+    ShortSlow,
+    MediumFast,
+    MediumSlow,
     #[default]
-    LongFastEu,
-    LongModerateEu,
-    LongSlowEu,
-    VeryLongSlowEu,
-    ShortFastUs,
-    ShortSlowUs,
-    MediumFastUs,
-    MediumSlowUs,
-    LongFastUs,
-    LongModerateUs,
-    LongSlowUs,
-    VeryLongSlowUs,
+    LongFast,
+    LongTurbo,
+    LongModerate, // as service channel
+    //LongSlow, deprecated presets
+    // VeryLongSlowEu 
 }
-
-pub struct Setting {
-    ch_500_khz: Channel,
-    ch_250_khz: Channel,
-    ch_125_khz: Channel,
+#[derive(Debug)]
+pub enum Error {
+    NoSlotsForBandwidth(&'static str),
+    InvalidSlot(u8),
 }
-
 
 impl MeshtasticConfig {
-    const REGION_FREQ : [( &'static str, Setting ); 3] = [
-        ("EU433", Setting { ch_500_khz: Channel::Custom(433_250_000), ch_250_khz: Channel::Custom(433_125_000), ch_125_khz: Channel::Custom(433_062_500) }),
-        ("EU868", Setting { ch_500_khz: Channel::Custom(869_650_000), ch_250_khz: Channel::Custom(869_525_000), ch_125_khz: Channel::Custom(869_462_500) }),
-        ("RU",    Setting { ch_500_khz: Channel::Custom(868_950_000), ch_250_khz: Channel::Custom(868_825_000), ch_125_khz: Channel::Custom(868_762_500) }),
-
+    pub const ALL: [MeshtasticConfig; 8] = [
+        MeshtasticConfig::ShortTurbo,
+        MeshtasticConfig::ShortFast,
+        MeshtasticConfig::ShortSlow,
+        MeshtasticConfig::MediumFast,
+        MeshtasticConfig::MediumSlow,
+        MeshtasticConfig::LongFast,
+        MeshtasticConfig::LongTurbo,
+        MeshtasticConfig::LongModerate,
     ];
-      
-
-    pub fn get_all_configs(&self, region: &str) -> Vec<(Bandwidth, Channel, Vec<(SpreadingFactor, bool, CodeRate)>)> {
-        // Find the region settings
-        let setting = Self::REGION_FREQ
-            .iter()
-            .find(|(r, _)| *r == region)
-            .map(|(_, s)| s)
-            .expect("Unknown region");
-        
-        // only 0 slots
-        vec![
-            (
-                Bandwidth::BW500,
-                setting.ch_500_khz,
-                vec![
-                    (SpreadingFactor::SF7, false, CodeRate::CR_4_5),
-                    (SpreadingFactor::SF11, false, CodeRate::CR_4_8),
-                ],
-            ),
-            (
-                Bandwidth::BW250,
-                setting.ch_250_khz,
-                vec![
-                    (SpreadingFactor::SF7, false, CodeRate::CR_4_5),
-                    (SpreadingFactor::SF8, false, CodeRate::CR_4_5),
-                    (SpreadingFactor::SF9, false, CodeRate::CR_4_5),
-                    (SpreadingFactor::SF10, false, CodeRate::CR_4_5),
-                    (SpreadingFactor::SF11, false, CodeRate::CR_4_5),
-                ],
-            ),
-            (
-                Bandwidth::BW125,
-                setting.ch_125_khz,
-                vec![
-                    (SpreadingFactor::SF11, true, CodeRate::CR_4_8),
-                    (SpreadingFactor::SF12, true, CodeRate::CR_4_8),
-                ],
-            ),
-        ]
+    pub fn get_avail_slots_cnt(region: &str, bw: Bandwidth) -> u8 {
+        match region {
+            "EU433" => match bw {
+                Bandwidth::BW62 => 0,
+                Bandwidth::BW125 => 8, // slots 0..=7
+                Bandwidth::BW250 => 4, // slots 0..=3
+                Bandwidth::BW500 => 2, // slots 0..=1
+            },
+            "EU868" => match bw {
+                Bandwidth::BW62 => 0,
+                Bandwidth::BW125 => 2, // slots 0..=1
+                Bandwidth::BW250 => 1, // slot 0
+                Bandwidth::BW500 => 0,
+            },
+            "RU" => match bw {
+                Bandwidth::BW62 => 0,
+                Bandwidth::BW125 => 4, // slots 0..=3
+                Bandwidth::BW250 => 2, // slots 0..=1
+                Bandwidth::BW500 => 1, // slot 0
+            },
+            _ => 0,
+        }
     }
 
-    pub fn to_config(&self) -> (Bandwidth, SpreadingFactor, CodeRate, Channel, bool) {
+
+    pub fn get_frequency_by_slot(region: &str, bw: Bandwidth, slot:u8) -> Result<Channel, Error>{
+        match region {
+            "EU433" => match bw{
+                Bandwidth::BW62  => Err(Error::NoSlotsForBandwidth("BW62 has no slots in EU433")),
+                Bandwidth::BW125 => match slot {
+                    0..=7 => Ok(Channel::Custom(433_062_500 + slot as u32*125_000)),
+                    s => Err(Error::InvalidSlot((s)))
+                },
+                Bandwidth::BW250 => match slot {
+                    0..=3 => Ok(Channel::Custom(433_125_000 + slot as u32*250_000)),
+                    s => Err(Error::InvalidSlot((s)))
+                },
+                Bandwidth::BW500 => match slot {
+                    0 | 1 => Ok(Channel::Custom(433_250_000 + slot as u32*500_000)),
+                    s => Err(Error::InvalidSlot((s)))
+                },
+            },
+            "EU868" => match bw {
+                Bandwidth::BW62  => Err(Error::NoSlotsForBandwidth("BW62 has no slots in EU868")),
+                Bandwidth::BW125 => match slot {
+                    0 | 1 => Ok(Channel::Custom(869_462_500 + slot as u32*125_000)),
+                    s => Err(Error::InvalidSlot((s)))
+                },
+                Bandwidth::BW250 => match slot {
+                    0 => Ok(Channel::Custom(869_525_000 + slot as u32*250_000)),
+                    s => Err(Error::InvalidSlot((s)))
+                },
+                Bandwidth::BW500 => Err(Error::NoSlotsForBandwidth("BW500 has no slots in EU868")),
+            },
+            "RU" => match bw {
+                Bandwidth::BW62  => Err(Error::NoSlotsForBandwidth("BW62 has no slots in RU")),
+                Bandwidth::BW125 => match slot {
+                    0..=3 => Ok(Channel::Custom(868_762_500 + slot as u32*125_000)),
+                    s => Err(Error::InvalidSlot((s)))
+                }
+                Bandwidth::BW250 => match slot {
+                    0 | 1 => Ok(Channel::Custom(868_825_000 + slot as u32*250_000)),
+                    s => Err(Error::InvalidSlot((s)))
+                }
+                Bandwidth::BW500 => match slot {
+                    0  => Ok(Channel::Custom(868_950_000 + slot as u32*500_000)),
+                    s => Err(Error::InvalidSlot((s)))
+                }
+            },
+            _ => Err(Error::NoSlotsForBandwidth("Unknown region, need implement in get_frequency_by_slot fn")),
+        }
+    }
+
+    pub fn to_config(&self, region: &str, slot:u8) -> (Bandwidth, SpreadingFactor, CodeRate, Channel, bool, u8) {
         match self {
-            Self::ShortFastEu => (
+            Self::ShortTurbo => (
+                Bandwidth::BW500,
+                SpreadingFactor::SF7,
+                CodeRate::CR_4_5,
+                Self::get_frequency_by_slot(region,Bandwidth::BW500,slot).unwrap(),
+                false,
+                Self::get_avail_slots_cnt(region, Bandwidth::BW500),
+            ),
+            Self::ShortFast => (
                 Bandwidth::BW250,
                 SpreadingFactor::SF7,
                 CodeRate::CR_4_5,
-                Channel::Custom(869525000),
+                Self::get_frequency_by_slot(region,Bandwidth::BW250,slot).unwrap(),
                 false,
+                Self::get_avail_slots_cnt(region, Bandwidth::BW250),
             ),
-            Self::ShortSlowEu => (
+            Self::ShortSlow => (
                 Bandwidth::BW250,
                 SpreadingFactor::SF8,
                 CodeRate::CR_4_5,
-                Channel::Custom(869525000),
+                Self::get_frequency_by_slot(region,Bandwidth::BW250,slot).unwrap(),
                 false,
+                Self::get_avail_slots_cnt(region, Bandwidth::BW250),
             ),
-            Self::MediumFastEu => (
+            Self::MediumFast => (
                 Bandwidth::BW250,
                 SpreadingFactor::SF9,
                 CodeRate::CR_4_5,
-                Channel::Custom(869525000),
+                Self::get_frequency_by_slot(region,Bandwidth::BW250,slot).unwrap(),
                 false,
+                Self::get_avail_slots_cnt(region, Bandwidth::BW250),
             ),
-            Self::MediumSlowEu => (
+            Self::MediumSlow => (
                 Bandwidth::BW250,
                 SpreadingFactor::SF10,
                 CodeRate::CR_4_5,
-                Channel::Custom(869525000),
+                Self::get_frequency_by_slot(region,Bandwidth::BW250,slot).unwrap(),
                 false,
+                Self::get_avail_slots_cnt(region, Bandwidth::BW250),
             ),
-            Self::LongFastEu => (
+            Self::LongFast => (
                 Bandwidth::BW250,
                 SpreadingFactor::SF11,
                 CodeRate::CR_4_5,
-                Channel::Custom(869525000),
+                Self::get_frequency_by_slot(region,Bandwidth::BW250,slot).unwrap(),
                 false,
+                Self::get_avail_slots_cnt(region, Bandwidth::BW250),
             ),
-            Self::LongModerateEu => (
+            Self::LongTurbo => (
+                Bandwidth::BW500,
+                SpreadingFactor::SF11,
+                CodeRate::CR_4_5,
+                Self::get_frequency_by_slot(region,Bandwidth::BW500,slot).unwrap(),
+                false,
+                Self::get_avail_slots_cnt(region, Bandwidth::BW500),
+            ),
+            Self::LongModerate => (
                 Bandwidth::BW125,
                 SpreadingFactor::SF11,
                 CodeRate::CR_4_8,
-                Channel::Custom(869587500),
+                Self::get_frequency_by_slot(region,Bandwidth::BW125,slot).unwrap(),
                 true,
+                Self::get_avail_slots_cnt(region, Bandwidth::BW125),
             ),
-            Self::LongSlowEu => (
-                Bandwidth::BW125,
-                SpreadingFactor::SF12,
-                CodeRate::CR_4_8,
-                Channel::Custom(869587500),
-                true,
-            ),
-            Self::VeryLongSlowEu => (
-                Bandwidth::BW62,
-                SpreadingFactor::SF12,
-                CodeRate::CR_4_8,
-                Channel::Custom(869492500),
-                true,
-            ),
-            Self::ShortFastUs => (
-                Bandwidth::BW250,
-                SpreadingFactor::SF7,
-                CodeRate::CR_4_5,
-                Channel::Custom(906875000),
-                false,
-            ),
-            Self::ShortSlowUs => (
-                Bandwidth::BW250,
-                SpreadingFactor::SF8,
-                CodeRate::CR_4_5,
-                Channel::Custom(906875000),
-                false,
-            ),
-            Self::MediumFastUs => (
-                Bandwidth::BW250,
-                SpreadingFactor::SF9,
-                CodeRate::CR_4_5,
-                Channel::Custom(906875000),
-                false,
-            ),
-            Self::MediumSlowUs => (
-                Bandwidth::BW250,
-                SpreadingFactor::SF10,
-                CodeRate::CR_4_5,
-                Channel::Custom(906875000),
-                false,
-            ),
-            Self::LongFastUs => (
-                Bandwidth::BW250,
-                SpreadingFactor::SF11,
-                CodeRate::CR_4_5,
-                Channel::Custom(906875000),
-                false,
-            ),
-            Self::LongModerateUs => (
-                Bandwidth::BW125,
-                SpreadingFactor::SF11,
-                CodeRate::CR_4_8,
-                Channel::Custom(904437500),
-                true,
-            ),
-            Self::LongSlowUs => (
-                Bandwidth::BW125,
-                SpreadingFactor::SF12,
-                CodeRate::CR_4_8,
-                Channel::Custom(904437500),
-                true,
-            ),
-            Self::VeryLongSlowUs => (
-                Bandwidth::BW62,
-                SpreadingFactor::SF12,
-                CodeRate::CR_4_8,
-                Channel::Custom(916218750),
-                true,
-            ),
+
         }
     }
 }
