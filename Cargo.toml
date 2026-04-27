@@ -15,7 +15,7 @@ chrono = "0.4"
 clap = { version = "4.5", features = ["derive"] }
 ctr = "0.9"
 futuredsp = { path = "../FutureSDR/crates/futuredsp" }
-futuresdr = { path = "../FutureSDR", features = ["seify", "soapy"] }
+futuresdr = { path = "../FutureSDR", features = ["seify"] }
 meshtastic = "0.1"
 num-traits = "0.2"
 rustfft = "6.4"
