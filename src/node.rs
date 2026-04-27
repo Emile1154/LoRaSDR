@@ -8,23 +8,27 @@ use futuresdr::runtime::Runtime;
 use anyhow::Result;
 use tokio::{net::UdpSocket, task::JoinHandle};
 
-use crate::{AddAWGN, ChannelPublisher, ChannelSubscriber, Decoder, Deinterleaver, FftDemod, FrameSync, GrayMapping, HammingDecoder, HeaderDecoder, HeaderMode, IqFrame, Transmitter, frame_sync, utils::{
+use crate::{AddAWGN, ChannelPublisher, ChannelSubscriber, Decoder, Deinterleaver, FftDemod, FrameSync, GrayMapping, HammingDecoder, HeaderDecoder, HeaderMode, IqFrame, Transmitter, default_values::ldro, frame_sync, meshtastic::MeshtasticConfig, utils::{
     Bandwidth, Channel, CodeRate, SpreadingFactor
 }};
 
 
 pub struct Node {
-    
-    //lora phy settings
-    channel : Channel,
-    bw : Bandwidth,
+    preset : MeshtasticConfig,
+
+    pub channel : Channel,
+    pub bw : Bandwidth,
     sf : SpreadingFactor,
+    cr : CodeRate,
+    ldr : bool,
+    pub avail_slots : u8,
+
     sync_word : u8, 
-    oversampling : usize,
     sigma : f32,
     
     //DSP interface
-    transmitter: BlockRef<Transmitter>,
+    transmitters: Vec<BlockRef<Transmitter>>,
+    selected_tx: u8,
     pub fg : Option<Flowgraph>,
 
     //aka MAC interface
@@ -34,12 +38,12 @@ pub struct Node {
 
 impl Node {
     pub fn new(
-        channel : Channel,
-        bw : Bandwidth,
-        sf : SpreadingFactor,
-        ldro : bool,
+        sel_preset : MeshtasticConfig,
+        region:&str,
+        slot:u8,
+
         sync_word : u8,
-        oversampling : usize,
+        
         sigma : f32,
         implicit_header : bool,
 
@@ -49,119 +53,121 @@ impl Node {
         local_port: u16,
         remote_port: u16,
 
-        // rt : Runtime<'_, SmolScheduler>,
     ) -> Result<Self> {
-        //TODO: coderate setup
-        //rx graph
-        let interpolation = match bw {
-            Bandwidth::BW62 => 16,
-            Bandwidth::BW125 => 8,
-            Bandwidth::BW250 => 4,
-            _ => panic!("wrong bandwidth for Meshtastic"),
-        };
 
+        let mut fg = Flowgraph::new();
+
+        let dest = format!("127.0.0.1:{}", remote_port);
 
         let subscriber =
         ChannelSubscriber::<DefaultCpuWriter<Complex32>>
         ::new(receiver);
+
+        let awgn = AddAWGN::<DefaultCpuReader<Complex32>, DefaultCpuWriter<Complex32>>::new(sigma, 42);
+
+        connect!(fg, subscriber > awgn);
+        let mut tx_vect = Vec::new();
+        for preset in MeshtasticConfig::ALL {
+            let (bw, sf, cr, channel, ldr, avail_slot) = preset.to_config(region, slot);
+            let interpolation = match bw {
+                Bandwidth::BW62 => 16,
+                Bandwidth::BW125 => 8,
+                Bandwidth::BW250 => 4,
+                Bandwidth::BW500 => 2,
+                _ => panic!("wrong bandwidth for Meshtastic"),
+            };
+            for slot_i in 0..avail_slot {
+                let (bw, sf, cr, channel, ldr, _) = preset.to_config(region, slot_i);
+
+                //rx graph pathes
+                let awgn = awgn.clone();
+                let udp_data = BlobToUdp::new(dest.clone());
+                let frame_sync: FrameSync = FrameSync::new(
+                    channel,
+                    bw,
+                    sf,
+                    implicit_header,
+                    vec![vec![16, 88]],
+                    interpolation,
+                    None,
+                    Some("header_crc_ok"),
+                    false,
+                    None,
+                );
+                let fft_demod: FftDemod = FftDemod::new(sf, ldr);
+                let gray_mapping: GrayMapping = GrayMapping::new();
+                let deinterleaver: Deinterleaver = Deinterleaver::new(
+                    ldr,
+                    sf
+                );
+                let hamming_dec: HammingDecoder = HammingDecoder::new();
+                let header_decoder: HeaderDecoder = HeaderDecoder::new(
+                    HeaderMode::Explicit,
+                    ldr,
+                );
+                let decoder: Decoder = Decoder::new();
+
+                connect!(fg,
+                    // rx graph
+                    awgn > frame_sync;
+                    frame_sync > fft_demod > gray_mapping > deinterleaver > hamming_dec > header_decoder;
+
+                    frame_sync.kiss           | udp_data;
+                    header_decoder.frame_info | frame_info.frame_sync;
+                    header_decoder            | decoder;
+                    header_decoder.kiss       | udp_data;
+                    decoder.crc_check         | payload_crc_result.frame_sync;
+                    decoder.kiss              | udp_data;
+                );
+            }
+            let publisher = ChannelPublisher::<DefaultCpuReader<Complex32>>::new(sender.clone());
+            // all tx pathes
+
+            let tx: Transmitter = Transmitter::new(
+                cr,
+                true,
+                sf,
+                ldr,
+                implicit_header,
+                interpolation,
+                vec![16, 88],
+                8,
+                10000,
+            );
+            connect!(fg, tx > publisher);
+            tx_vect.push(tx);
+        }
         
-        let awgn = AddAWGN
-        ::<DefaultCpuReader<Complex32>, DefaultCpuWriter<Complex32>>
-        ::new(sigma, 42);
-        // let throttle = futuresdr::blocks::Throttle::<Complex32>::new(samplerate as f64);
-
-        // let decimation = match bw {
-        //     Bandwidth::BW62 => 4,
-        //     Bandwidth::BW125 => 2,
-        //     Bandwidth::BW250 => 1,
-        //     _ => panic!("wrong bandwidth for Meshtastic"),
-        // };
-        // let cutoff = Into::<f64>::into(bw) / 2.0 / 1e6;
-        // let transition_bw = Into::<f64>::into(bw) / 10.0 / 1e6;
-        // let taps = firdes::kaiser::lowpass(cutoff, transition_bw, 0.05);
-        // let decimation: XlatingFir = XlatingFir::with_taps(taps, decimation, 200e3, 1e6);
-
-
-        let frame_sync: FrameSync = FrameSync::new(
-            channel,
-            bw,
-            sf,
-            implicit_header,
-            vec![vec![16, 88]],
-            interpolation,
-            None,
-            Some("header_crc_ok"),
-            false,
-            None,
-        );
-
-        let fft_demod: FftDemod = FftDemod::new(sf, ldro);
-        let gray_mapping: GrayMapping = GrayMapping::new();
-        let deinterleaver: Deinterleaver = Deinterleaver::new(
-            ldro,
-            sf
-        );
-        let hamming_dec: HammingDecoder = HammingDecoder::new();
-        let header_decoder: HeaderDecoder = HeaderDecoder::new(
-            HeaderMode::Explicit,
-            ldro,
-        );
-        let decoder: Decoder = Decoder::new();
-        let dest = format!("127.0.0.1:{}", remote_port);
-        let udp_data: BlobToUdp = BlobToUdp::new(dest);
-
-        //tx graph
-        let transmitter: Transmitter = Transmitter::new(
-            CodeRate::CR_4_5,
-            true,
-            sf,
-            ldro,
-            implicit_header,
-            interpolation,
-            vec![16, 88],
-            8,
-            10000,
-        );
-        let publisher = ChannelPublisher
-        ::<DefaultCpuReader<Complex32>>
-        ::new(sender);
-
-        //flowgraph connection
-        let mut fg = Flowgraph::new();
-        
-        connect!(fg,
-            // rx graph 
-            subscriber > awgn > frame_sync; 
-            frame_sync > fft_demod > gray_mapping > deinterleaver > hamming_dec > header_decoder;
-
-            frame_sync.kiss           | udp_data;
-            header_decoder.frame_info | frame_info.frame_sync;
-            header_decoder            | decoder;
-            header_decoder.kiss       | udp_data;
-            decoder.crc_check         | payload_crc_result.frame_sync;
-            decoder.kiss              | udp_data;
-            // tx graph
-            transmitter > publisher;
-        );    
-
         
         println!("flowgraph started");
-        
+
+        let (bw, sf, cr, channel, ldr, avail) = sel_preset.to_config(region, slot);
+       
         Ok(Self {
+            preset: sel_preset,
             channel,
             bw,
             sf,
+            cr,
+            ldr,
+            avail_slots: avail,
             sync_word,
-            oversampling,
             sigma,
+            selected_tx: sel_preset as u8,
             fg: Some(fg),
-            transmitter: transmitter,
+            transmitters: tx_vect,
             remote_port,
             local_port,
         })
     }
 
-    async fn server_task_body(mut handle: FlowgraphHandle, tx_id : BlockId, local_port: u16) {
+    async fn set_preset(&mut self, preset :MeshtasticConfig, region:&str, slot:u8){
+        (self.bw, self.sf, self.cr, self.channel, self.ldr, self.avail_slots) = preset.to_config(region, slot);
+        self.preset = preset;
+        self.selected_tx = preset as u8;
+    }
+   
+    async fn server_task_body(mut handle: FlowgraphHandle, txs_ids : Vec<BlockId>, local_port: u16, selected_tx : u8) {
         let src = format!("127.0.0.1:{}", local_port);
         let socket= match UdpSocket::bind(src).await {
             Ok(s) => s,
@@ -170,7 +176,7 @@ impl Node {
                 return;
             }
         };
-       
+        
         let mut buf = vec![0u8; 1500];
         let resp = [0xC0, 0x0F, 0x00, 0xC0];
         println!("thread running, listen port: {}", local_port);
@@ -178,7 +184,7 @@ impl Node {
             match socket.recv_from(&mut buf).await {
                 Ok((n, _peer)) => {
                     let payload = buf[..n].to_vec();
-                    if let Err(e) = handle.call(tx_id, "msg", Pmt::Blob(payload)).await {
+                    if let Err(e) = handle.call(txs_ids[selected_tx as usize], "msg", Pmt::Blob(payload)).await {
                         eprintln!("flowgraph call error: {}", e);
                     }
                     if let Err(e) = socket.send_to(&resp, _peer).await {
@@ -194,11 +200,11 @@ impl Node {
     }
 
     pub fn server_task_create(&self, handle: FlowgraphHandle) {
-        let tx_id = self.transmitter.clone().into();
+        let txs_ids: Vec<BlockId> = self.transmitters.iter().map(|tx| tx.into()).collect();
         let local_port = self.local_port;
 
         tokio::spawn(
-            Self::server_task_body(handle, tx_id, local_port)
+            Self::server_task_body(handle, txs_ids, local_port, self.selected_tx)
         );
     }
 
@@ -220,20 +226,20 @@ impl Node {
     }
     
 
-    pub fn get_sample_rate(self) -> u32 {
-        if matches!(self.bw, Bandwidth::BW62) {
-            return 62500*self.oversampling as u32;
-        }
-        if matches!(self.bw, Bandwidth::BW125) {
-            return 125000*self.oversampling as u32;
-        }
-        if matches!(self.bw, Bandwidth::BW250) {
-            return 250000*self.oversampling as u32;
-        }
-        if matches!(self.bw, Bandwidth::BW500) {
-            return 500000*self.oversampling as u32;
-        }
-        return 0;
-    }
+    // pub fn get_sample_rate(self) -> u32 {
+    //     if matches!(self.bw, Bandwidth::BW62) {
+    //         return 62500*self.oversampling as u32;
+    //     }
+    //     if matches!(self.bw, Bandwidth::BW125) {
+    //         return 125000*self.oversampling as u32;
+    //     }
+    //     if matches!(self.bw, Bandwidth::BW250) {
+    //         return 250000*self.oversampling as u32;
+    //     }
+    //     if matches!(self.bw, Bandwidth::BW500) {
+    //         return 500000*self.oversampling as u32;
+    //     }
+    //     return 0;
+    // }
 
 }

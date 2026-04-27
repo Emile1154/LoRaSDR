@@ -17,7 +17,7 @@ async fn main() -> Result<()> {
     let oversampling = 4; 
     let noise_std =2e-6;
 
-    let (bandwidth, spreading_factor, _, channel, ldro) = MeshtasticConfig::LongFastEu.to_config();
+    // let (bandwidth, spreading_factor, _, channel, ldro) = MeshtasticConfig::LongFastEu.to_config();
     
     let n = 2;
     let mut d_matrix=vec![vec![0f32; n]; n];
@@ -29,12 +29,10 @@ async fn main() -> Result<()> {
     let rx_nodes = vec![rx_node_pub, rx_node_pub2];
 
     let node = Node::new(
-        channel,
-        bandwidth,
-        spreading_factor,
-        ldro,
+        MeshtasticConfig::LongFast,
+        "RU",
+        0,
         sync_word,
-        oversampling,
         noise_std,
         false,
         rx_node_sub,
@@ -44,12 +42,10 @@ async fn main() -> Result<()> {
  
     );
     let node2 = Node::new(
-        channel,
-        bandwidth,
-        spreading_factor,
-        ldro,
+        MeshtasticConfig::LongFast,
+        "RU",
+        0,
         sync_word,
-        oversampling,
         noise_std,
         false,
         rx_node_sub2,
