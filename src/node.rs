@@ -1,9 +1,9 @@
 use core::time;
 use std::sync::Arc;
 
-use crossbeam_channel::{Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender, unbounded};
 use futuredsp::firdes;
-use futuresdr::{async_io::Timer, blocks::{BlobToUdp, XlatingFir}, macros::connect, prelude::{Complex32, DefaultCpuReader, DefaultCpuWriter}, runtime::{BlockId, BlockRef, Flowgraph, FlowgraphHandle, Pmt, WrappedKernel, scheduler::SmolScheduler}, tracing::Instrument};
+use futuresdr::{async_io::Timer, blocks::{BlobToUdp, XlatingFir}, macros::connect, prelude::{Complex32, CpuBufferWriter, DefaultCpuReader, DefaultCpuWriter}, runtime::{BlockId, BlockRef, Flowgraph, FlowgraphHandle, Pmt, WrappedKernel, scheduler::SmolScheduler}, tracing::Instrument};
 use futuresdr::runtime::Runtime;
 use anyhow::Result;
 use tokio::{net::UdpSocket, task::JoinHandle};
@@ -12,6 +12,33 @@ use crate::{AddAWGN, ChannelPublisher, ChannelSubscriber, Decoder, Deinterleaver
     Bandwidth, Channel, CodeRate, SpreadingFactor
 }};
 
+impl Clone for Node{
+    fn clone(&self) -> Self {
+        Node {
+            preset: self.preset,
+            channel: self.channel,
+            bw: self.bw,           
+            sf: self.sf,
+            cr: self.cr,
+            ldr: self.ldr,
+            avail_slots: self.avail_slots,
+            sync_word: self.sync_word,
+            sigma: self.sigma,
+            transmitters: Vec::new(), // drop heavy items
+            selected_tx: self.selected_tx,
+            fg: None,                // skip cloning flowgraph
+            remote_port: self.remote_port,
+            local_port: self.local_port,
+            position: self.position.clone(), 
+            tx_out: self.tx_out.clone(),
+            rx_in: self.rx_in.clone(),
+        }
+    }
+}
+
+
+#[derive(Clone)]
+pub struct Pos2d { pub x: f32, pub y: f32 }
 
 pub struct Node {
     preset : MeshtasticConfig,
@@ -33,7 +60,11 @@ pub struct Node {
 
     //aka MAC interface
     remote_port: u16, // remote port
-    local_port : u16, // node rcv port
+    pub local_port : u16, // node rcv port
+    
+    pub position: Pos2d,
+    pub tx_out: Receiver<IqFrame>,   // channel processor reads node TX from here
+    pub rx_in: Sender<IqFrame>,      // channel processor writes node RX to here
 }
 
 impl Node {
@@ -47,11 +78,9 @@ impl Node {
         sigma : f32,
         implicit_header : bool,
 
-        receiver: Receiver<IqFrame>,
-        sender: Sender<IqFrame>,
-
         local_port: u16,
         remote_port: u16,
+        position: Pos2d,
 
     ) -> Result<Self> {
 
@@ -59,15 +88,19 @@ impl Node {
 
         let dest = format!("127.0.0.1:{}", remote_port);
 
+        let (node_tx, tx_out) = unbounded::<IqFrame>();
+        let (rx_in, node_rx) = unbounded::<IqFrame>();
+
         let subscriber =
         ChannelSubscriber::<DefaultCpuWriter<Complex32>>
-        ::new(receiver);
+        ::new(node_rx);
 
-        let awgn = AddAWGN::<DefaultCpuReader<Complex32>, DefaultCpuWriter<Complex32>>::new(sigma, 42);
+        let mut awgn = AddAWGN::<DefaultCpuReader<Complex32>, DefaultCpuWriter<Complex32>>::new(sigma, 42);
+        // awgn.output().set_min_buffer_size_in_items(1024);
 
-        connect!(fg, subscriber > awgn);
+        // connect!(fg, subscriber > awgn);
         let mut tx_vect = Vec::new();
-        for preset in MeshtasticConfig::ALL {
+        let preset = MeshtasticConfig::LongFast; 
             let (bw, sf, cr, channel, ldr, avail_slot) = preset.to_config(region, slot);
             let interpolation = match bw {
                 Bandwidth::BW62 => 16,
@@ -76,11 +109,36 @@ impl Node {
                 Bandwidth::BW500 => 2,
                 _ => panic!("wrong bandwidth for Meshtastic"),
             };
-            for slot_i in 0..avail_slot {
+            let slot_i = 0;
+            // for slot_i in 0..avail_slot {
+        
+                // if std::mem::discriminant(&preset) != std::mem::discriminant(&sel_preset)
+                //     || slot_i != slot {
+                //     continue;
+                // }
                 let (bw, sf, cr, channel, ldr, _) = preset.to_config(region, slot_i);
-
+                let publisher = ChannelPublisher::<DefaultCpuReader<Complex32>>::new(
+                    node_tx.clone(),
+                    f64::from(channel),
+                    f32::from(bw),
+                );
+                // all tx pathes
+            
+                let tx: Transmitter = Transmitter::new(
+                    cr,
+                    true,
+                    sf,
+                    ldr,
+                    implicit_header,
+                    interpolation,
+                    vec![16, 88],
+                    8,
+                    10000,
+                );
+                // connect!(fg, tx > publisher);
+                
                 //rx graph pathes
-                let awgn = awgn.clone();
+                // let awgn = awgn.clone();
                 let udp_data = BlobToUdp::new(dest.clone());
                 let frame_sync: FrameSync = FrameSync::new(
                     channel,
@@ -109,7 +167,7 @@ impl Node {
 
                 connect!(fg,
                     // rx graph
-                    awgn > frame_sync;
+                    subscriber > awgn > frame_sync;
                     frame_sync > fft_demod > gray_mapping > deinterleaver > hamming_dec > header_decoder;
 
                     frame_sync.kiss           | udp_data;
@@ -118,25 +176,11 @@ impl Node {
                     header_decoder.kiss       | udp_data;
                     decoder.crc_check         | payload_crc_result.frame_sync;
                     decoder.kiss              | udp_data;
+                    tx > publisher;
                 );
-            }
-            let publisher = ChannelPublisher::<DefaultCpuReader<Complex32>>::new(sender.clone());
-            // all tx pathes
-
-            let tx: Transmitter = Transmitter::new(
-                cr,
-                true,
-                sf,
-                ldr,
-                implicit_header,
-                interpolation,
-                vec![16, 88],
-                8,
-                10000,
-            );
-            connect!(fg, tx > publisher);
+            // }
             tx_vect.push(tx);
-        }
+        
         
         
         println!("flowgraph started");
@@ -153,11 +197,14 @@ impl Node {
             avail_slots: avail,
             sync_word,
             sigma,
-            selected_tx: sel_preset as u8,
+            selected_tx: 0 as u8,
             fg: Some(fg),
             transmitters: tx_vect,
             remote_port,
             local_port,
+            position,
+            tx_out,
+            rx_in,
         })
     }
 
@@ -184,6 +231,7 @@ impl Node {
             match socket.recv_from(&mut buf).await {
                 Ok((n, _peer)) => {
                     let payload = buf[..n].to_vec();
+                    
                     if let Err(e) = handle.call(txs_ids[selected_tx as usize], "msg", Pmt::Blob(payload)).await {
                         eprintln!("flowgraph call error: {}", e);
                     }

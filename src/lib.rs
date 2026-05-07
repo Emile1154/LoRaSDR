@@ -18,6 +18,7 @@ pub use transmitter::Transmitter;
 pub use channel::ChannelProcessor;
 pub use awgn::AddAWGN;
 pub use node::Node;
+pub use node::Pos2d;
 pub use kiss_driver::{create_cmd, escape, descape};
 
 pub mod awgn;

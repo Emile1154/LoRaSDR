@@ -5,8 +5,11 @@ use crossbeam_channel::{Sender, Receiver};
 #[repr(C)]
 #[derive(Debug, Clone)]
 pub struct IqFrame {
-    pub epoch: u64,
+    pub start_index: u64,
     pub samples: [Complex32; 1024],
+    
+    pub fc: f64,
+    pub bw: f32,
 }
 
 #[derive(Block)]
@@ -19,21 +22,29 @@ where
 
     sender: Option<Sender<IqFrame>>,
     n: usize,
-    epoch: u64,
+    start_index: u64,
     tmpbuf: Vec<Complex32>,
+    fc: f64,
+    bw: f32,
 }
 
 impl<I> ChannelPublisher<I>
 where
     I: CpuBufferReader<Item = Complex32>,
 {
-    pub fn new(sender: Sender<IqFrame>) -> Self {
-        return Self {
+    pub fn new(
+        sender: Sender<IqFrame>,
+        fc: f64,
+        bw: f32,
+    ) -> Self {
+        Self {
             input: I::default(),
             sender: Some(sender),
             n: 0,
-            epoch: 0,
+            start_index: 0,
             tmpbuf: vec![Complex32::default(); 1024],
+            fc,
+            bw,
         }
     }
 }
@@ -44,30 +55,27 @@ where
 {
     async fn work(
         &mut self,
-        io: &mut WorkIo,
+        _io: &mut WorkIo,
         _mio: &mut MessageOutputs,
         _b: &mut BlockMeta,
     ) -> Result<()> {
-        
-        
         let input_slice = self.input.slice();
         let available = input_slice.len();
-        
+
         let mut processed = 0;
         let space_left = 1024 - self.n;
-        
+
         // Process available samples
         if available > 0 {
             let to_process = std::cmp::min(available, space_left);
-            
+
             for i in 0..to_process {
                 self.tmpbuf[self.n + i] = input_slice[i];
             }
             processed = to_process;
             self.n += processed;
-            // space_left -= to_process;
         }
-        
+
         if self.n < 1024 && input_slice.is_empty() {
             
             for i in self.n..1024 {
@@ -75,36 +83,36 @@ where
             }
             self.n = 1024;
         }
-        
+
         if self.n >= 1024 {
             let frame = IqFrame {
-                epoch: self.epoch,
+                start_index: self.start_index,
                 samples: {
                     let mut samples = [Complex32::default(); 1024];
                     samples.copy_from_slice(&self.tmpbuf[..1024]);
                     samples
                 },
+                fc: self.fc,
+                bw: self.bw,
             };
-        
+
             if let Some(ref sender) = self.sender {
-                // println!("Sending frame");
                 if sender.send(frame).is_err() {
-                    // Handle send error gracefully
                     println!("Failed to send frame");
                 }
             }
-            
+
             self.n = 0;
-            self.epoch += 1;
+            self.start_index += 1;
             // Clear the temp buffer for the next frame
             for i in 0..self.tmpbuf.len() {
                 self.tmpbuf[i] = Complex32::default();
             }
         }
-        
+
         // Consume the input data that was processed
         self.input.consume(processed);
-        
+
         Ok(())
     }
 }
@@ -147,8 +155,6 @@ where
         _mio: &mut MessageOutputs,
         _b: &mut BlockMeta,
     ) -> Result<()> {
-        // io.call_again = true;
-
         let produced;
 
         {
@@ -196,4 +202,3 @@ where
 
 
 }
-

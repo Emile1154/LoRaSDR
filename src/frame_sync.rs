@@ -1129,6 +1129,7 @@ where
 
         let mut output = O::default();
         output.set_min_items(m_number_of_bins_tmp);
+        // output.set_min_buffer_size_in_items(m_number_of_bins_tmp);
 
         Self {
             input,
