@@ -164,7 +164,7 @@ where
             while written < out.len() {
                 if self.current.is_none() {
                     if let Some(ref rx) = self.receiver {
-                        if let Ok(frame) = rx.recv() {
+                        if let Ok(frame) = rx.try_recv() {
                             self.current = Some(frame);
                             self.pos = 0;
                         }
