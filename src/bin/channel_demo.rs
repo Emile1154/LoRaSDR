@@ -10,7 +10,7 @@ async fn main() -> Result<()> {
 
     let mut node = Node::new(
         MeshtasticConfig::LongFast,
-        "EU868",
+        "RU",
         0,
         sync_word,
         noise_std,
@@ -22,7 +22,7 @@ async fn main() -> Result<()> {
 
     let mut node2 = Node::new(
         MeshtasticConfig::LongFast,
-        "EU868",
+        "RU",
         0,
         sync_word,
         noise_std,
