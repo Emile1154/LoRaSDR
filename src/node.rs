@@ -96,11 +96,11 @@ impl Node {
         ::new(node_rx);
 
         let mut awgn = AddAWGN::<DefaultCpuReader<Complex32>, DefaultCpuWriter<Complex32>>::new(sigma, 42);
-        // awgn.output().set_min_buffer_size_in_items(1024);
+        awgn.output().set_min_buffer_size_in_items(65536);
 
-        // connect!(fg, subscriber > awgn);
+        connect!(fg, subscriber > awgn);
         let mut tx_vect = Vec::new();
-        let preset = MeshtasticConfig::LongFast; 
+        for preset in MeshtasticConfig::ALL{
             let (bw, sf, cr, channel, ldr, avail_slot) = preset.to_config(region, slot);
             let interpolation = match bw {
                 Bandwidth::BW62 => 16,
@@ -109,36 +109,17 @@ impl Node {
                 Bandwidth::BW500 => 2,
                 _ => panic!("wrong bandwidth for Meshtastic"),
             };
-            let slot_i = 0;
-            // for slot_i in 0..avail_slot {
+            for slot_i in 0..avail_slot {
         
-                // if std::mem::discriminant(&preset) != std::mem::discriminant(&sel_preset)
-                //     || slot_i != slot {
-                //     continue;
-                // }
-                let (bw, sf, cr, channel, ldr, _) = preset.to_config(region, slot_i);
-                let publisher = ChannelPublisher::<DefaultCpuReader<Complex32>>::new(
-                    node_tx.clone(),
-                    f64::from(channel),
-                    f32::from(bw),
-                );
-                // all tx pathes
-            
-                let tx: Transmitter = Transmitter::new(
-                    cr,
-                    true,
-                    sf,
-                    ldr,
-                    implicit_header,
-                    interpolation,
-                    vec![16, 88],
-                    8,
-                    10000,
-                );
-                // connect!(fg, tx > publisher);
+                if slot_i != slot {
+                    continue;
+                }
                 
+        
+                let (bw, sf, cr, channel, ldr, _) = preset.to_config(region, slot_i);
+
                 //rx graph pathes
-                // let awgn = awgn.clone();
+                let awgn = awgn.clone();
                 let udp_data = BlobToUdp::new(dest.clone());
                 let frame_sync: FrameSync = FrameSync::new(
                     channel,
@@ -167,7 +148,7 @@ impl Node {
 
                 connect!(fg,
                     // rx graph
-                    subscriber > awgn > frame_sync;
+                    awgn > frame_sync;
                     frame_sync > fft_demod > gray_mapping > deinterleaver > hamming_dec > header_decoder;
 
                     frame_sync.kiss           | udp_data;
@@ -176,12 +157,29 @@ impl Node {
                     header_decoder.kiss       | udp_data;
                     decoder.crc_check         | payload_crc_result.frame_sync;
                     decoder.kiss              | udp_data;
-                    tx > publisher;
                 );
-            // }
+            }
+            let publisher = ChannelPublisher::<DefaultCpuReader<Complex32>>::new(
+                node_tx.clone(),
+                f64::from(channel),
+                f32::from(bw),
+            );
+            // all tx pathes
+           
+            let tx: Transmitter = Transmitter::new(
+                cr,
+                true,
+                sf,
+                ldr,
+                implicit_header,
+                interpolation,
+                vec![16, 88],
+                8,
+                10000,
+            );
+            connect!(fg, tx > publisher);
             tx_vect.push(tx);
-        
-        
+        }
         
         println!("flowgraph started");
 
@@ -197,7 +195,7 @@ impl Node {
             avail_slots: avail,
             sync_word,
             sigma,
-            selected_tx: 0 as u8,
+            selected_tx: sel_preset as u8,
             fg: Some(fg),
             transmitters: tx_vect,
             remote_port,
@@ -214,7 +212,9 @@ impl Node {
         self.selected_tx = preset as u8;
     }
    
-    async fn server_task_body(mut handle: FlowgraphHandle, txs_ids : Vec<BlockId>, local_port: u16, selected_tx : u8) {
+    async fn server_task_body(mut handle: FlowgraphHandle, txs_ids : Vec<BlockId>, local_port: u16, mut selected_tx : u8) {
+        use crate::kiss_driver::kiss;
+
         let src = format!("127.0.0.1:{}", local_port);
         let socket= match UdpSocket::bind(src).await {
             Ok(s) => s,
@@ -223,7 +223,7 @@ impl Node {
                 return;
             }
         };
-        
+
         let mut buf = vec![0u8; 1500];
         let resp = [0xC0, 0x0F, 0x00, 0xC0];
         println!("thread running, listen port: {}", local_port);
@@ -231,10 +231,22 @@ impl Node {
             match socket.recv_from(&mut buf).await {
                 Ok((n, _peer)) => {
                     let payload = buf[..n].to_vec();
-                    
-                    if let Err(e) = handle.call(txs_ids[selected_tx as usize], "msg", Pmt::Blob(payload)).await {
-                        eprintln!("flowgraph call error: {}", e);
+
+                    // Parse KISS frame: [FEND, cmd, data..., FEND]
+                    let is_config_cmd = payload.len() >= 2
+                        && payload[0] == kiss::FEND
+                        && payload[1] != kiss::CMD_DATA;
+
+                    if is_config_cmd {
+                        let cmd = payload[1];
+                        eprintln!("KISS config cmd 0x{:02X} received, updating selected_tx if needed", cmd);
+                    } else {
+                        // CMD_DATA or raw frame — forward to transmitter as actual TX payload
+                        if let Err(e) = handle.call(txs_ids[selected_tx as usize], "msg", Pmt::Blob(payload)).await {
+                            eprintln!("flowgraph call error: {}", e);
+                        }
                     }
+
                     if let Err(e) = socket.send_to(&resp, _peer).await {
                         eprintln!("error sending response: {}", e);
                     }
@@ -242,8 +254,8 @@ impl Node {
                 Err(e) => {
                     eprintln!("socket recv error: {}", e);
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                }   
-            }            
+                }
+            }
         }
     }
 
