@@ -1,9 +1,9 @@
 
 // --> RX commands
 // CMD DETECT
-// CMD DATA
 // CMD SNR
 // CMD RSSI
+// CMD DATA
 // CMD READY
 //---------------
 // TX commands

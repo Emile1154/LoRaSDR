@@ -88,6 +88,7 @@ struct State {
     m_symb_numb: usize,          //<number of payload lora symbols
     m_received_head: bool, //< indicate that the header has be decoded and received by this block
     snr_est: f64,          //< estimate of the snr
+    avg_rssi: f32,         //< average RSSI estimate from preamble (dBm)
     in_down: Vec<Complex32>, //< downsampled input
     m_downchirp: Vec<Complex32>, //< Reference downchirp
     m_upchirp: Vec<Complex32>, //< Reference upchirp
@@ -856,30 +857,18 @@ impl State {
                 (items_to_consume, items_to_output) =
                     self.sync_quarter_down(input, out, tags, nitems_to_process);
                 
-                let snr = self.snr_est as f32;
-                let snr_bytes = snr.to_le_bytes();
-
-                let cmd_snr = create_cmd(kiss::CMD_SNR, &snr_bytes);
-                _mio.post("kiss", Pmt::Blob(cmd_snr.clone())).await;
-
-                
-                let mut avg_rssi:f32 = 0.0;
                 if nitems_to_process > 0 {
                     let mut sum_dbm: f32 = 0.0;
-                    for sample in input{
+                    for sample in input {
                         let magnitude_squared = sample.norm_sqr();
                         if magnitude_squared > 0.0 {
-                            let dbm = (10.0 * (magnitude_squared/0.001).ln()*LOG10_E) as f32;
-                            sum_dbm += dbm
-                        }else{
+                            sum_dbm += 10.0 * (magnitude_squared / 0.001).ln() * LOG10_E;
+                        } else {
                             sum_dbm += -1000.0;
                         }
                     }
-                    avg_rssi = sum_dbm / nitems_to_process as f32
+                    self.avg_rssi = sum_dbm / nitems_to_process as f32;
                 }
-                
-                let cmd_rssi = create_cmd(kiss::CMD_RSSI,&avg_rssi.to_le_bytes() );
-                _mio.post("kiss", Pmt::Blob(cmd_rssi.clone())).await;
 
             }
             _ => warn!("encountered unexpercted symbol_cnt SyncState."),
@@ -887,11 +876,11 @@ impl State {
         (items_to_consume, items_to_output)
     }
 
-    fn compensate_sfo(
+    async fn compensate_sfo<'a>(
         &mut self,
-        // input: &[Complex32],
         out: &mut [Complex32],
-        tags: &mut Tags,
+        tags: &'a mut Tags<'a>,
+        mio: &mut MessageOutputs,
     ) -> (isize, usize) {
         if let Ok(Some(Pmt::MapStrPmt(mut frame_info))) =
             self.tag_from_msg_handler_to_work_channel.1.try_next()
@@ -909,6 +898,8 @@ impl State {
             }
             // frame_info.insert(String::from("cfo_int"), Pmt::Isize(self.m_cfo_int));
             // frame_info.insert(String::from("cfo_frac"), Pmt::F64(self.m_cfo_frac));
+            let snr_bytes = (self.snr_est as f32).to_le_bytes();
+            
             frame_info.insert(String::from("snr"), Pmt::F64(self.snr_est));
             tags.add_tag(
                 0,
@@ -917,6 +908,13 @@ impl State {
                     Box::new(Pmt::MapStrPmt(frame_info)),
                 ),
             );
+
+            
+            let cmd_snr = create_cmd(kiss::CMD_SNR, &snr_bytes);
+            mio.post("kiss", Pmt::Blob(cmd_snr)).await.ok();
+
+            let cmd_rssi = create_cmd(kiss::CMD_RSSI, &self.avg_rssi.to_le_bytes());
+            mio.post("kiss", Pmt::Blob(cmd_rssi)).await.ok();
         }
 
         // transmit only useful symbols (at least 8 symbol for PHY header)  // TODO implicit header?
@@ -1175,6 +1173,7 @@ where
                 m_symb_numb: 0,                //<number of payload lora symbols
                 m_received_head: false, //< indicate that the header has be decoded and received by this block
                 snr_est: 0.0,           //< estimate of the snr
+                avg_rssi: 0.0,          //< average RSSI estimate from preamble (dBm)
                 additional_upchirps: 0, //< indicate the number of additional upchirps found in preamble (in addition to the minimum required to trigger a detection)
                 m_cfo_frac: 0.0,        //< fractional part of CFO
                 sfo_hat: 0.0,           //< estimated sampling frequency offset
@@ -1428,7 +1427,7 @@ where
                     let (items_to_consume, items_to_output) = self.s.sync(input, out, &mut out_tags, nitems_to_process, _mio).await;
                     (items_to_consume, items_to_output)
                 }
-                DecoderState::SfoCompensation => self.s.compensate_sfo(out, &mut out_tags),
+                DecoderState::SfoCompensation => self.s.compensate_sfo(out, &mut out_tags, _mio).await,
             };
             
             debug_assert!(
