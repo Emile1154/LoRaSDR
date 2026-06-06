@@ -65,7 +65,7 @@ async fn main() -> Result<()> {
     }
 
     const SYNC_WORD: u8 = 0x2b;
-
+    const SCALE: f32 = 100.0;
     let mut nodes: Vec<Node> = Vec::with_capacity(configs.len());
 
     for cfg in &configs {
@@ -81,7 +81,7 @@ async fn main() -> Result<()> {
             false,
             cfg.remote_port,
             cfg.local_port,
-            Pos2d { x: cfg.x, y: cfg.y },
+            Pos2d { x: cfg.x/SCALE, y: cfg.y/SCALE },
         )
         .with_context(|| {
             format!(
