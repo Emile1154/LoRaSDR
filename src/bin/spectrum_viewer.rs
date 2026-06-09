@@ -17,7 +17,10 @@
 //!   * `window`    — STFT FFT size: small = fine time (resolves chirps),
 //!      large = fine frequency;
 //!   * `time/row`  — keep every Nth window (waterfall scroll speed), without
-//!      averaging so a chirp stays a sharp diagonal.
+//!      averaging so a chirp stays a sharp diagonal;
+//!   * `Pause`     — freeze the spectrum and waterfall (socket keeps draining);
+//!   * mouse wheel over the waterfall — scroll back through history; `Live`
+//!      jumps back to the newest row.
 //!
 //! Usage: spectrum_viewer --port <PORT> [--title <NAME>]
 
@@ -36,7 +39,8 @@ use tungstenite::stream::MaybeTlsStream;
 
 use lora::SPECTRUM_FFT_SIZE;
 
-const WF_H: usize = 256; // waterfall history rows
+const WF_H: usize = 256; // waterfall rows shown at once
+const WF_HIST: usize = 1024; // waterfall history kept for scrollback (>= WF_H)
 const SPAN_DB: f32 = 100.0; // displayed dynamic range
 const SAMPLE_RATE_HZ: f64 = 1.0e6; // bw*interpolation = 1 MHz for every preset
 const RULER_H: f32 = 22.0;
@@ -89,6 +93,7 @@ struct MyApp {
     gain_initialized: bool,
     zoom: f32,
     time_div: usize, // keep every Nth window on the waterfall
+    paused: bool,    // freeze spectrum + waterfall processing
 
     socket: WebSocket<MaybeTlsStream<TcpStream>>,
 
@@ -101,10 +106,13 @@ struct MyApp {
     win_buf: Vec<Complex32>,
     iq: Vec<Complex32>, // sample accumulator
 
-    norm: Vec<f32>,  // latest normalised spectrum (len fft_size, DC centred)
-    decim: usize,    // window counter for time_div decimation
+    norm: Vec<f32>,    // latest normalised spectrum (len fft_size, DC centred)
+    wf_acc: Vec<f32>,  // max-hold accumulator over a time_div group of windows
+    decim: usize,      // window counter for time_div decimation
 
-    wf_pixels: Vec<Color32>, // fft_size wide * WF_H tall
+    wf_hist: Vec<Color32>,  // fft_size wide * WF_HIST tall (row 0 = newest)
+    wf_view: Vec<Color32>,  // fft_size wide * WF_H tall (current visible window)
+    wf_scroll: usize,       // rows scrolled back from live (0 = live)
     wf_tex: Option<TextureHandle>,
 }
 
@@ -126,6 +134,7 @@ impl MyApp {
             gain_initialized: false,
             zoom: 1.0,
             time_div: 8,
+            paused: false,
             socket,
             fft_size: 0,
             planner: FftPlanner::new(),
@@ -135,8 +144,11 @@ impl MyApp {
             win_buf: Vec::new(),
             iq: Vec::new(),
             norm: Vec::new(),
+            wf_acc: Vec::new(),
             decim: 0,
-            wf_pixels: Vec::new(),
+            wf_hist: Vec::new(),
+            wf_view: Vec::new(),
+            wf_scroll: 0,
             wf_tex: None,
         };
         app.set_fft_size(SPECTRUM_FFT_SIZE);
@@ -162,7 +174,10 @@ impl MyApp {
             .collect();
         self.win_buf = vec![Complex32::default(); n];
         self.norm = vec![0.0; n];
-        self.wf_pixels = vec![Color32::BLACK; n * WF_H];
+        self.wf_acc = vec![0.0; n];
+        self.wf_hist = vec![Color32::BLACK; n * WF_HIST];
+        self.wf_view = vec![Color32::BLACK; n * WF_H];
+        self.wf_scroll = 0;
         self.wf_tex = None; // texture dimensions changed
         self.decim = 0;
     }
@@ -202,9 +217,20 @@ impl MyApp {
             avail = MAX_WINDOWS_PER_TICK;
         }
 
+        let n = self.fft_size;
         let mut idx = 0;
         for _ in 0..avail {
             self.compute_window(idx);
+            // Max-hold across the decimation group so dropped windows still
+            if self.decim == 0 {
+                self.wf_acc.copy_from_slice(&self.norm);
+            } else {
+                for i in 0..n {
+                    if self.norm[i] > self.wf_acc[i] {
+                        self.wf_acc[i] = self.norm[i];
+                    }
+                }
+            }
             self.decim += 1;
             if self.decim >= self.time_div.max(1) {
                 self.push_wf_row();
@@ -216,7 +242,7 @@ impl MyApp {
     }
 
     /// FFT one window starting at `start`, writing the normalised, DC-centred
-    /// magnitude into `self.norm`.
+    /// magnitude into
     fn compute_window(&mut self, start: usize) {
         let n = self.fft_size;
         for i in 0..n {
@@ -243,17 +269,26 @@ impl MyApp {
 
     fn push_wf_row(&mut self) {
         let n = self.fft_size;
-        self.wf_pixels.copy_within(0..n * (WF_H - 1), n);
+        // Shift the whole history down by one row; newest goes to row 0 (top).
+        self.wf_hist.copy_within(0..n * (WF_HIST - 1), n);
         for i in 0..n {
-            self.wf_pixels[i] = color_map(self.norm[i]);
+            self.wf_hist[i] = color_map(self.wf_acc[i]);
+        }
+        // Hold the viewed historical band in place as new rows arrive.
+        if self.wf_scroll > 0 {
+            self.wf_scroll = (self.wf_scroll + 1).min(WF_HIST - WF_H);
         }
     }
 }
 
 impl eframe::App for MyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Always drain the socket (keeps the connection healthy even when
+        // paused); only run the STFT when not paused so the display freezes.
         self.poll_iq();
-        self.process();
+        if !self.paused {
+            self.process();
+        }
         // Bound the accumulator if the viewer ever falls behind.
         let cap = self.fft_size * (MAX_WINDOWS_PER_TICK + 8);
         if self.iq.len() > cap {
@@ -299,6 +334,12 @@ impl eframe::App for MyApp {
                 );
                 if ui.button("Auto gain").clicked() {
                     self.gain_initialized = false;
+                }
+                if ui.button(if self.paused { "▶ Resume" } else { "⏸ Pause" }).clicked() {
+                    self.paused = !self.paused;
+                }
+                if ui.button("⤓ Live").clicked() {
+                    self.wf_scroll = 0;
                 }
             });
         });
@@ -390,7 +431,23 @@ impl MyApp {
     fn draw_waterfall(&mut self, ui: &egui::Ui, ctx: &egui::Context, rect: Rect,
                       start: usize, n_show: usize) {
         let n = self.fft_size;
-        let image = ColorImage::new([n, WF_H], self.wf_pixels.clone());
+        let max_scroll = WF_HIST - WF_H;
+
+        // Mouse-wheel scrollback through the waterfall history when hovering it.
+        let resp = ui.interact(rect, egui::Id::new("wf_area"), egui::Sense::hover());
+        if resp.hovered() {
+            let dy = ui.input(|i| i.raw_scroll_delta.y);
+            if dy != 0.0 {
+                // Wheel up (dy > 0) → go back in time (older rows).
+                let nv = (self.wf_scroll as i32 + (dy / 2.0) as i32).clamp(0, max_scroll as i32);
+                self.wf_scroll = nv as usize;
+            }
+        }
+        let off = self.wf_scroll.min(max_scroll);
+
+        // Copy the visible WF_H rows [off .. off+WF_H] out of the history.
+        self.wf_view.copy_from_slice(&self.wf_hist[off * n..(off + WF_H) * n]);
+        let image = ColorImage::new([n, WF_H], self.wf_view.clone());
         match &mut self.wf_tex {
             Some(tex) => tex.set(image, TextureOptions::LINEAR),
             None => {
@@ -407,6 +464,22 @@ impl MyApp {
                 rect,
                 Rect::from_min_max(Pos2::new(u0, 0.0), Pos2::new(u1, 1.0)),
                 Color32::WHITE,
+            );
+
+            // Status badge: live / scrolled-back / paused.
+            let status = if self.paused {
+                format!("PAUSED   ↑{} rows", off)
+            } else if off > 0 {
+                format!("HISTORY  ↑{} rows  (scroll / Live)", off)
+            } else {
+                "LIVE".to_string()
+            };
+            painter.text(
+                Pos2::new(rect.left() + 6.0, rect.top() + 4.0),
+                egui::Align2::LEFT_TOP,
+                status,
+                egui::FontId::monospace(11.0),
+                Color32::from_gray(210),
             );
         }
     }
