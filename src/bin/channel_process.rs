@@ -68,9 +68,15 @@ async fn main() -> Result<()> {
     const SCALE: f32 = 100.0;
     let mut nodes: Vec<Node> = Vec::with_capacity(configs.len());
 
-    for cfg in &configs {
+    // Kept clear of node web_port (9000+), tcp_port (4403) and local/remote
+    // UDP ports (55554+) so the spectrum WebSocket never clashes with a
+    // host-networked meshtasticd container (which would kill the flowgraph).
+    const SPECTRUM_PORT_BASE: u16 = 18000;
+
+    for (i, cfg) in configs.iter().enumerate() {
         let preset = map_preset(&cfg.modem_preset);
         let region = map_region(&cfg.region);
+        let spectrum_port = SPECTRUM_PORT_BASE + i as u16;
 
         let node = Node::new(
             preset,
@@ -82,6 +88,7 @@ async fn main() -> Result<()> {
             cfg.remote_port,
             cfg.local_port,
             Pos2d { x: cfg.x/SCALE, y: cfg.y/SCALE },
+            spectrum_port,
         )
         .with_context(|| {
             format!(
@@ -90,6 +97,8 @@ async fn main() -> Result<()> {
             )
         })?;
         println!("noise std {}", cfg.noise_std);
+        // Machine-readable line the GUI parses to map a node to its spectrum feed.
+        println!("SPECTRUM node={} local_port={} port={}", i, cfg.local_port, spectrum_port);
         nodes.push(node);
     }
     let mut rt = Runtime::new();

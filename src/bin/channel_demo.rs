@@ -17,7 +17,8 @@ async fn main() -> Result<()> {
         false,
         55554,
         55555,
-        Pos2d { x: 0.0, y: 25.0 }
+        Pos2d { x: 0.0, y: 25.0 },
+        9000
     ).unwrap();
 
     let mut node2 = Node::new(
@@ -29,7 +30,8 @@ async fn main() -> Result<()> {
         false,
         55556,
         55557,
-        Pos2d { x: 0.0, y: 0.0 }
+        Pos2d { x: 0.0, y: 0.0 },
+        9001
     ).unwrap();
 
     let mut rt = Runtime::new();

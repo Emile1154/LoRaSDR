@@ -3,12 +3,12 @@ use std::sync::Arc;
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use futuredsp::firdes;
-use futuresdr::{async_io::Timer, blocks::{BlobToUdp, XlatingFir}, macros::connect, prelude::{Complex32, CpuBufferWriter, DefaultCpuReader, DefaultCpuWriter}, runtime::{BlockId, BlockRef, Flowgraph, FlowgraphHandle, Pmt, WrappedKernel, scheduler::SmolScheduler}, tracing::Instrument};
+use futuresdr::{async_io::Timer, blocks::{BlobToUdp, WebsocketSinkBuilder, WebsocketSinkMode, XlatingFir}, macros::connect, prelude::{Complex32, CpuBufferWriter, DefaultCpuReader, DefaultCpuWriter}, runtime::{BlockId, BlockRef, Flowgraph, FlowgraphHandle, Pmt, WrappedKernel, scheduler::SmolScheduler}, tracing::Instrument};
 use futuresdr::runtime::Runtime;
 use anyhow::Result;
 use tokio::{net::UdpSocket, task::JoinHandle};
 
-use crate::{AddAWGN, ChannelPublisher, ChannelSubscriber, Decoder, Deinterleaver, FftDemod, FrameSync, GrayMapping, HammingDecoder, HeaderDecoder, HeaderMode, IqFrame, Transmitter, default_values::ldro, frame_sync, meshtastic::MeshtasticConfig, utils::{
+use crate::{AddAWGN, ChannelPublisher, ChannelSubscriber, Decoder, Deinterleaver, FftDemod, FrameSync, GrayMapping, HammingDecoder, HeaderDecoder, HeaderMode, IqFrame, SPECTRUM_IQ_BLOCK, Transmitter, default_values::ldro, frame_sync, meshtastic::MeshtasticConfig, utils::{
     Bandwidth, Channel, CodeRate, SpreadingFactor
 }};
 
@@ -81,6 +81,7 @@ impl Node {
         local_port: u16,
         remote_port: u16,
         position: Pos2d,
+        spectrum_port: u16,
 
     ) -> Result<Self> {
 
@@ -99,6 +100,21 @@ impl Node {
         awgn.output().set_min_buffer_size_in_items(65536);
 
         connect!(fg, subscriber > awgn);
+
+        // Live spectrum tap: fan the post-channel RX signal (after path loss +
+        // AWGN) out to a WebSocket as *raw complex IQ*. The GUI does its own
+        // short-window STFT, so it can trade time vs frequency resolution live
+        // (and actually resolve the LoRa chirp sweeps). FixedDropping keeps the
+        // sink from ever back-pressuring the radio when no viewer is attached.
+        // Port 0 disables the feed.
+        if spectrum_port != 0 {
+            let awgn_spec = awgn.clone();
+            let ws = WebsocketSinkBuilder::<Complex32>::new(spectrum_port as u32)
+                .mode(WebsocketSinkMode::FixedDropping(SPECTRUM_IQ_BLOCK))
+                .build();
+            connect!(fg, awgn_spec > ws);
+        }
+
         let mut tx_vect = Vec::new();
         for preset in MeshtasticConfig::ALL{
             let (bw, sf, cr, channel, ldr, avail_slot) = preset.to_config(region, slot);

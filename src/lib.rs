@@ -21,6 +21,11 @@ pub use node::Node;
 pub use node::Pos2d;
 pub use kiss_driver::{create_cmd, escape, descape};
 
+/// Default FFT window the spectrum viewer starts with.
+pub const SPECTRUM_FFT_SIZE: usize = 256;
+/// Chunk size (complex samples) the raw-IQ spectrum WebSocket emits per message.
+pub const SPECTRUM_IQ_BLOCK: usize = 4096;
+
 pub mod awgn;
 pub mod kiss_driver;
 pub mod channel;
