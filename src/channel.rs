@@ -1,6 +1,7 @@
 use futuresdr::num_complex::Complex32;
 use std::collections::BTreeMap;
-use crate::{IqFrame, Node};
+use std::sync::{Arc, Mutex};
+use crate::{IqFrame, Node, Pos2d};
 
 /// Global sample rate in Hz (must match the rate used by all transmitters)
 const GLOBAL_SAMPLE_RATE: f64 = 1_000_000.0;
@@ -8,7 +9,7 @@ const MAX_FRAME_LEN: usize = 1024;
 
 struct Frame {
     frame: IqFrame,
-    node: Node,
+    tx_idx: usize,
 }
 // --- Add this struct definition somewhere (outside the loop) ---
 #[derive(Clone)]
@@ -58,17 +59,26 @@ impl RxFilter {
 pub struct ChannelProcessor {
     nodes: Vec<Node>,
     pending_frames: BTreeMap<u64, Vec<Frame>>,
+    /// Live node positions, shared so an external control task
+    positions: Arc<Mutex<Vec<Pos2d>>>,
 }
 
 impl ChannelProcessor {
     pub fn new(nodes: Vec<Node>) -> Self {
+        let positions = nodes.iter().map(|n| n.position.clone()).collect();
         Self {
             nodes,
             pending_frames: BTreeMap::new(),
+            positions: Arc::new(Mutex::new(positions)),
         }
     }
 
-    async fn distance(a: &crate::Pos2d, b: &crate::Pos2d) -> f32 {
+    /// Handle to the live positions, for a control task to update on the fly.
+    pub fn positions_handle(&self) -> Arc<Mutex<Vec<Pos2d>>> {
+        Arc::clone(&self.positions)
+    }
+
+    fn distance(a: &Pos2d, b: &Pos2d) -> f32 {
         let dx = a.x - b.x;
         let dy = a.y - b.y;
         (dx * dx + dy * dy).sqrt()
@@ -76,13 +86,13 @@ impl ChannelProcessor {
 
     async fn run(&mut self) {
         loop {
-            for node in self.nodes.iter() {
+            for (idx, node) in self.nodes.iter().enumerate() {
                 match node.tx_out.try_recv() {
                     Ok(frame) => {
                         self.pending_frames
                             .entry(frame.start_index)
                             .or_default()
-                            .push(Frame { frame, node: node.clone() });
+                            .push(Frame { frame, tx_idx: idx });
                     },
                     Err(_) => {continue;}
                 }
@@ -92,14 +102,16 @@ impl ChannelProcessor {
                 continue;
             };
 
-            for receiver_node in self.nodes.iter() {
+            // Snapshot the live positions once per frame group (drag updates are
+            // rare, so cloning a few Pos2d here is negligible).
+            let pos = self.positions.lock().unwrap().clone();
+
+            for (rx_idx, receiver_node) in self.nodes.iter().enumerate() {
                 let mut txbuf = vec![Complex32::new(0.0, 0.0); 1024];
                 let rx_freq = f64::from(receiver_node.channel);
                 let rx_bw = f64::from(receiver_node.bw);
                 for frame in frames {
-                    let xmit_node = &frame.node;
-
-                    let d = ChannelProcessor::distance(&receiver_node.position, &xmit_node.position).await;
+                    let d = ChannelProcessor::distance(&pos[rx_idx], &pos[frame.tx_idx]);
                     if d == 0.0 {
                         continue;
                     }

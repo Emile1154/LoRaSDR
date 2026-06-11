@@ -1,12 +1,65 @@
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::{env, fs};
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use tokio::net::UdpSocket;
 
 use futuresdr::prelude::*;
 
 use lora::meshtastic::MeshtasticConfig;
 use lora::{ChannelProcessor, Node, Pos2d};
+
+/// UDP port on which the channel listens for live node-position updates from
+/// the GUI (sent when a node is dragged on the topology map).
+const CONTROL_PORT: u16 = 17000;
+/// GUI pixels per channel distance unit (must match node creation below).
+const POS_SCALE: f32 = 100.0;
+
+#[derive(Deserialize)]
+struct PosUpdate {
+    local_port: u16,
+    x: f32,
+    y: f32,
+}
+
+/// Background task: receive `{ "local_port", "x", "y" }` datagrams and update
+/// the shared live positions used by the channel for path-loss.
+async fn position_control_task(
+    positions: Arc<Mutex<Vec<Pos2d>>>,
+    port_to_idx: HashMap<u16, usize>,
+    control_port: u16,
+) {
+    let sock = match UdpSocket::bind(("127.0.0.1", control_port)).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("position control: cannot bind {control_port}: {e}");
+            return;
+        }
+    };
+    println!("CONTROL port={control_port}");
+
+    let mut buf = vec![0u8; 1024];
+    loop {
+        match sock.recv_from(&mut buf).await {
+            Ok((n, _peer)) => {
+                if let Ok(upd) = serde_json::from_slice::<PosUpdate>(&buf[..n]) {
+                    if let Some(&idx) = port_to_idx.get(&upd.local_port) {
+                        let mut p = positions.lock().unwrap();
+                        if idx < p.len() {
+                            p[idx] = Pos2d { x: upd.x / POS_SCALE, y: upd.y / POS_SCALE };
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("position control recv error: {e}");
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+    }
+}
 
 #[derive(Deserialize)]
 struct NodeConfig {
@@ -106,9 +159,20 @@ async fn main() -> Result<()> {
         node.start(&mut rt, true).map_err(|e| anyhow::anyhow!("{}", e))?;
     }
     
+    // Map local_port -> node index so the GUI can address position updates by
+    // port regardless of node ordering.
+    let port_to_idx: HashMap<u16, usize> = configs
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (c.local_port, i))
+        .collect();
+
     println!("Channel simulation running with {} nodes", nodes.len());
-    let _handle = ChannelProcessor::new(nodes).spawn_task();
-  
+    let processor = ChannelProcessor::new(nodes);
+    let positions = processor.positions_handle();
+    tokio::spawn(position_control_task(positions, port_to_idx, CONTROL_PORT));
+    let _handle = processor.spawn_task();
+
     std::future::pending::<()>().await;
     Ok(())
 }
