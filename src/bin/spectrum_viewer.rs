@@ -16,8 +16,6 @@
 //!   * `scale`     — frequency zoom (show only the central band);
 //!   * `window`    — STFT FFT size: small = fine time (resolves chirps),
 //!      large = fine frequency;
-//!   * `time/row`  — keep every Nth window (waterfall scroll speed), without
-//!      averaging so a chirp stays a sharp diagonal;
 //!   * `Pause`     — freeze the spectrum and waterfall (socket keeps draining);
 //!   * mouse wheel over the waterfall — scroll back through history; `Live`
 //!      jumps back to the newest row.
@@ -40,7 +38,7 @@ use tungstenite::stream::MaybeTlsStream;
 use lora::SPECTRUM_FFT_SIZE;
 
 const WF_H: usize = 256; // waterfall rows shown at once
-const WF_HIST: usize = 1024; // waterfall history kept for scrollback (>= WF_H)
+const WF_HIST: usize = 4096; // waterfall history kept for scrollback (>= WF_H)
 const SPAN_DB: f32 = 100.0; // displayed dynamic range
 const SAMPLE_RATE_HZ: f64 = 1.0e6; // bw*interpolation = 1 MHz for every preset
 const RULER_H: f32 = 22.0;
@@ -92,7 +90,6 @@ struct MyApp {
     gain_db: f32,
     gain_initialized: bool,
     zoom: f32,
-    time_div: usize, // keep every Nth window on the waterfall
     paused: bool,    // freeze spectrum + waterfall processing
 
     socket: WebSocket<MaybeTlsStream<TcpStream>>,
@@ -107,8 +104,6 @@ struct MyApp {
     iq: Vec<Complex32>, // sample accumulator
 
     norm: Vec<f32>,    // latest normalised spectrum (len fft_size, DC centred)
-    wf_acc: Vec<f32>,  // max-hold accumulator over a time_div group of windows
-    decim: usize,      // window counter for time_div decimation
 
     wf_hist: Vec<Color32>,  // fft_size wide * WF_HIST tall (row 0 = newest)
     wf_view: Vec<Color32>,  // fft_size wide * WF_H tall (current visible window)
@@ -133,7 +128,6 @@ impl MyApp {
             gain_db: 0.0,
             gain_initialized: false,
             zoom: 1.0,
-            time_div: 8,
             paused: false,
             socket,
             fft_size: 0,
@@ -144,8 +138,6 @@ impl MyApp {
             win_buf: Vec::new(),
             iq: Vec::new(),
             norm: Vec::new(),
-            wf_acc: Vec::new(),
-            decim: 0,
             wf_hist: Vec::new(),
             wf_view: Vec::new(),
             wf_scroll: 0,
@@ -174,12 +166,10 @@ impl MyApp {
             .collect();
         self.win_buf = vec![Complex32::default(); n];
         self.norm = vec![0.0; n];
-        self.wf_acc = vec![0.0; n];
         self.wf_hist = vec![Color32::BLACK; n * WF_HIST];
         self.wf_view = vec![Color32::BLACK; n * WF_H];
         self.wf_scroll = 0;
         self.wf_tex = None; // texture dimensions changed
-        self.decim = 0;
     }
 
     /// Drain the WebSocket, appending every received raw-IQ sample (8 bytes:
@@ -217,25 +207,10 @@ impl MyApp {
             avail = MAX_WINDOWS_PER_TICK;
         }
 
-        let n = self.fft_size;
         let mut idx = 0;
         for _ in 0..avail {
             self.compute_window(idx);
-            // Max-hold across the decimation group so dropped windows still
-            if self.decim == 0 {
-                self.wf_acc.copy_from_slice(&self.norm);
-            } else {
-                for i in 0..n {
-                    if self.norm[i] > self.wf_acc[i] {
-                        self.wf_acc[i] = self.norm[i];
-                    }
-                }
-            }
-            self.decim += 1;
-            if self.decim >= self.time_div.max(1) {
-                self.push_wf_row();
-                self.decim = 0;
-            }
+            self.push_wf_row();
             idx += hop;
         }
         self.iq.drain(0..idx);
@@ -272,7 +247,7 @@ impl MyApp {
         // Shift the whole history down by one row; newest goes to row 0 (top).
         self.wf_hist.copy_within(0..n * (WF_HIST - 1), n);
         for i in 0..n {
-            self.wf_hist[i] = color_map(self.wf_acc[i]);
+            self.wf_hist[i] = color_map(self.norm[i]);
         }
         // Hold the viewed historical band in place as new rows arrive.
         if self.wf_scroll > 0 {
@@ -327,11 +302,6 @@ impl eframe::App for MyApp {
                 {
                     self.set_fft_size(win);
                 }
-                ui.add(
-                    egui::Slider::new(&mut self.time_div, 1..=256)
-                        .logarithmic(true)
-                        .text("time/row"),
-                );
                 if ui.button("Auto gain").clicked() {
                     self.gain_initialized = false;
                 }
